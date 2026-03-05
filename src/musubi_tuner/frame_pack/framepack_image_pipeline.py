@@ -179,6 +179,7 @@ class FramePackImagePipeline:
         image_encoder: str,
         device: Optional[Union[str, torch.device]] = None,
         attn_mode: str = "torch",
+        split_attn: bool = False,
         fp8: bool = False,
         fp8_scaled: bool = False,
         fp8_fast_quantization_mode: Optional[str] = None,
@@ -213,6 +214,7 @@ class FramePackImagePipeline:
             image_encoder: Path to CLIP vision encoder.
             device: Device for inference. Defaults to CUDA if available.
             attn_mode: Attention mode ("torch", "flash", "sageattn", "xformers", "sdpa").
+            split_attn: Whether to split attention for memory efficiency.
             fp8: Use fp8 for DiT model.
             fp8_scaled: Use scaled fp8 for DiT.
             fp8_fast_quantization_mode: Quantization mode for fp8 ("tensor", "block", "channel", or None).
@@ -269,6 +271,7 @@ class FramePackImagePipeline:
             loading_device,
             fp8_scaled,
             nvfp4,
+            split_attn=split_attn,
             for_inference=True,
             lora_weights_list=lora_weights_list,
             lora_multipliers=lora_multipliers,
@@ -289,7 +292,9 @@ class FramePackImagePipeline:
 
         if blocks_to_swap > 0:
             logger.info(f"Enable swap {blocks_to_swap} blocks to CPU from device: {device}")
-            dit_model.enable_block_swap(blocks_to_swap, device, supports_backward=False, use_pinned_memory=use_pinned_memory_for_block_swap)
+            dit_model.enable_block_swap(
+                blocks_to_swap, device, supports_backward=False, use_pinned_memory=use_pinned_memory_for_block_swap
+            )
             dit_model.move_to_device_except_swap_blocks(device)
             dit_model.prepare_block_swap_before_forward()
         else:
@@ -298,7 +303,9 @@ class FramePackImagePipeline:
         if compile:
             compile_ns = _make_args_namespace(compile=True, **(compile_args or {}))
             dit_model = model_utils.compile_transformer(
-                compile_ns, dit_model, [dit_model.transformer_blocks, dit_model.single_transformer_blocks],
+                compile_ns,
+                dit_model,
+                [dit_model.transformer_blocks, dit_model.single_transformer_blocks],
                 disable_linear=blocks_to_swap > 0,
             )
 
@@ -414,18 +421,22 @@ class FramePackImagePipeline:
             decoded_images = self._decode_latents(all_latents)
 
             for i in range(n):
-                results.append(PipelineOutput(
-                    image=decoded_images[i],
-                    latent=all_latents[i] if output_type == "both" else None,
-                    seed=all_seeds[i],
-                ))
+                results.append(
+                    PipelineOutput(
+                        image=decoded_images[i],
+                        latent=all_latents[i] if output_type == "both" else None,
+                        seed=all_seeds[i],
+                    )
+                )
         else:
             for i in range(n):
-                results.append(PipelineOutput(
-                    image=None,
-                    latent=all_latents[i],
-                    seed=all_seeds[i],
-                ))
+                results.append(
+                    PipelineOutput(
+                        image=None,
+                        latent=all_latents[i],
+                        seed=all_seeds[i],
+                    )
+                )
 
         clean_memory_on_device(device)
         return results
@@ -454,8 +465,11 @@ class FramePackImagePipeline:
                         llama_vec, clip_l_pooler = conds_cache[prompt]
                     else:
                         llama_vec, clip_l_pooler = hunyuan.encode_prompt_conds(
-                            prompt, self.text_encoder1, self.text_encoder2,
-                            self.tokenizer1, self.tokenizer2,
+                            prompt,
+                            self.text_encoder1,
+                            self.text_encoder2,
+                            self.tokenizer1,
+                            self.tokenizer2,
                             custom_system_prompt=inp.custom_system_prompt,
                         )
                         llama_vec = llama_vec.cpu()
@@ -474,8 +488,11 @@ class FramePackImagePipeline:
                         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
                     else:
                         llama_vec_n, clip_l_pooler_n = hunyuan.encode_prompt_conds(
-                            n_prompt, self.text_encoder1, self.text_encoder2,
-                            self.tokenizer1, self.tokenizer2,
+                            n_prompt,
+                            self.text_encoder1,
+                            self.text_encoder2,
+                            self.tokenizer1,
+                            self.tokenizer2,
                             custom_system_prompt=inp.custom_system_prompt,
                         )
                         llama_vec_n = llama_vec_n.cpu()
@@ -483,18 +500,20 @@ class FramePackImagePipeline:
                         conds_cache[n_prompt] = (llama_vec_n, clip_l_pooler_n)
                         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
-                results.append({
-                    "context": {
-                        "llama_vec": llama_vec_padded,
-                        "llama_attention_mask": llama_attention_mask,
-                        "clip_l_pooler": clip_l_pooler,
-                    },
-                    "context_null": {
-                        "llama_vec": llama_vec_n,
-                        "llama_attention_mask": llama_attention_mask_n,
-                        "clip_l_pooler": clip_l_pooler_n,
-                    },
-                })
+                results.append(
+                    {
+                        "context": {
+                            "llama_vec": llama_vec_padded,
+                            "llama_attention_mask": llama_attention_mask,
+                            "clip_l_pooler": clip_l_pooler,
+                        },
+                        "context_null": {
+                            "llama_vec": llama_vec_n,
+                            "llama_attention_mask": llama_attention_mask_n,
+                            "clip_l_pooler": clip_l_pooler_n,
+                        },
+                    }
+                )
         finally:
             self.text_encoder1.to("cpu")
             self.text_encoder2.to("cpu")
@@ -558,14 +577,16 @@ class FramePackImagePipeline:
                         control_latents.append(ctrl_latent)
                         control_mask_images.append(ctrl_alpha)
 
-                results.append({
-                    "height": height,
-                    "width": width,
-                    "image_encoder_last_hidden_state": image_encoder_last_hidden_state,
-                    "start_latent": start_latent,
-                    "control_latents": control_latents,
-                    "control_mask_images": control_mask_images,
-                })
+                results.append(
+                    {
+                        "height": height,
+                        "width": width,
+                        "image_encoder_last_hidden_state": image_encoder_last_hidden_state,
+                        "start_latent": start_latent,
+                        "control_latents": control_latents,
+                        "control_mask_images": control_mask_images,
+                    }
+                )
         finally:
             self.vae.to("cpu")
             self.image_encoder.to("cpu")
@@ -615,9 +636,13 @@ class FramePackImagePipeline:
             if inp.guidance_scale != ref.guidance_scale:
                 raise ValueError(f"Batch item {i} has guidance_scale={inp.guidance_scale} but item 0 has {ref.guidance_scale}.")
             if inp.embedded_cfg_scale != ref.embedded_cfg_scale:
-                raise ValueError(f"Batch item {i} has embedded_cfg_scale={inp.embedded_cfg_scale} but item 0 has {ref.embedded_cfg_scale}.")
+                raise ValueError(
+                    f"Batch item {i} has embedded_cfg_scale={inp.embedded_cfg_scale} but item 0 has {ref.embedded_cfg_scale}."
+                )
             if inp.guidance_rescale != ref.guidance_rescale:
-                raise ValueError(f"Batch item {i} has guidance_rescale={inp.guidance_rescale} but item 0 has {ref.guidance_rescale}.")
+                raise ValueError(
+                    f"Batch item {i} has guidance_rescale={inp.guidance_rescale} but item 0 has {ref.guidance_rescale}."
+                )
             if inp.flow_shift != ref.flow_shift:
                 raise ValueError(f"Batch item {i} has flow_shift={inp.flow_shift} but item 0 has {ref.flow_shift}.")
             item_one_frame = inp.one_frame_settings or OneFrameSettings()
@@ -664,12 +689,12 @@ class FramePackImagePipeline:
                 for j, mask_img in enumerate(inp.control_masks):
                     if mask_img is not None and j < item_clean.shape[2]:
                         mask_tensor = self._get_latent_mask(mask_img, height, width)
-                        item_clean[:, :, j:j+1, :, :] = item_clean[:, :, j:j+1, :, :] * mask_tensor
+                        item_clean[:, :, j : j + 1, :, :] = item_clean[:, :, j : j + 1, :, :] * mask_tensor
             elif control_masks:
                 for j, alpha in enumerate(control_masks):
                     if alpha is not None and j < item_clean.shape[2]:
                         mask_tensor = self._get_latent_mask(alpha, height, width)
-                        item_clean[:, :, j:j+1, :, :] = item_clean[:, :, j:j+1, :, :] * mask_tensor
+                        item_clean[:, :, j : j + 1, :, :] = item_clean[:, :, j : j + 1, :, :] * mask_tensor
 
             per_item_clean_latents.append(item_clean)
 
@@ -722,11 +747,15 @@ class FramePackImagePipeline:
         llama_vecs = torch.cat([td["context"]["llama_vec"] for td in text_data], dim=0).to(device, dtype=torch.bfloat16)
         llama_masks = torch.cat([td["context"]["llama_attention_mask"] for td in text_data], dim=0).to(device)
         clip_poolers = torch.cat([td["context"]["clip_l_pooler"] for td in text_data], dim=0).to(device, dtype=torch.bfloat16)
-        img_embeds = torch.cat([imd["image_encoder_last_hidden_state"] for imd in image_data], dim=0).to(device, dtype=torch.bfloat16)
+        img_embeds = torch.cat([imd["image_encoder_last_hidden_state"] for imd in image_data], dim=0).to(
+            device, dtype=torch.bfloat16
+        )
 
         llama_vecs_n = torch.cat([td["context_null"]["llama_vec"] for td in text_data], dim=0).to(device, dtype=torch.bfloat16)
         llama_masks_n = torch.cat([td["context_null"]["llama_attention_mask"] for td in text_data], dim=0).to(device)
-        clip_poolers_n = torch.cat([td["context_null"]["clip_l_pooler"] for td in text_data], dim=0).to(device, dtype=torch.bfloat16)
+        clip_poolers_n = torch.cat([td["context_null"]["clip_l_pooler"] for td in text_data], dim=0).to(
+            device, dtype=torch.bfloat16
+        )
 
         # --- Single batched call to sample_hunyuan ---
         generated = sample_hunyuan(
@@ -761,7 +790,7 @@ class FramePackImagePipeline:
         )
 
         # Split batch results into per-item latents
-        result_latents = [generated[i:i+1].to(torch.float32).cpu() for i in range(batch_size)]
+        result_latents = [generated[i : i + 1].to(torch.float32).cpu() for i in range(batch_size)]
 
         return result_latents, seeds
 
@@ -794,7 +823,7 @@ class FramePackImagePipeline:
                 # Decode each frame separately (one-frame inference produces 1 frame typically)
                 pixels_list = []
                 for i in range(latent.shape[2]):
-                    frame_pixels = hunyuan.vae_decode(latent[:, :, i:i+1, :, :].to(device), self.vae).cpu()
+                    frame_pixels = hunyuan.vae_decode(latent[:, :, i : i + 1, :, :].to(device), self.vae).cpu()
                     pixels_list.append(frame_pixels)
                 pixels = torch.cat(pixels_list, dim=2)
 
@@ -817,6 +846,7 @@ class FramePackImagePipeline:
         """Move DiT model to CPU to free GPU memory."""
         if self.blocks_to_swap > 0:
             import time
+
             time.sleep(5)  # wait for block swap to finish
         self.dit_model.to("cpu")
         clean_memory_on_device(self.device)

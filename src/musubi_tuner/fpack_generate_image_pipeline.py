@@ -92,16 +92,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_path", type=str, default=None, help="Image for CLIP embedding (I2V)")
     parser.add_argument("--control_image_path", type=str, nargs="*", default=None, help="Control image path(s)")
     parser.add_argument("--control_image_mask_path", type=str, nargs="*", default=None, help="Control image mask path(s)")
-    parser.add_argument("--one_frame_inference", type=str, default=None,
-                        help="One-frame mode options, comma separated: no_2x, no_4x, no_post, target_index=N, control_index=N;N")
+    parser.add_argument(
+        "--one_frame_inference",
+        type=str,
+        default=None,
+        help="One-frame mode options, comma separated: no_2x, no_4x, no_post, target_index=N, control_index=N;N",
+    )
     parser.add_argument("--custom_system_prompt", type=str, default=None)
 
     # Batch / output
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file (one per line)")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for DiT generation")
     parser.add_argument("--save_path", type=str, required=True, help="Directory to save outputs")
-    parser.add_argument("--output_type", type=str, default="pil", choices=["pil", "latent", "both"],
-                        help="Output type: pil (images), latent (safetensors), both")
+    parser.add_argument(
+        "--output_type",
+        type=str,
+        default="pil",
+        choices=["pil", "latent", "both"],
+        help="Output type: pil (images), latent (safetensors), both",
+    )
 
     # Device
     parser.add_argument("--device", type=str, default=None, help="Device (default: cuda if available)")
@@ -213,9 +222,7 @@ def parse_prompt_line(line: str, defaults: argparse.Namespace) -> ImageInput:
         elif opt == "of":
             one_frame_str = val
 
-    image, control_images, control_masks = load_images_if_paths(
-        image_path, control_paths or None, mask_paths or None
-    )
+    image, control_images, control_masks = load_images_if_paths(image_path, control_paths or None, mask_paths or None)
 
     return ImageInput(
         prompt=prompt,
@@ -250,6 +257,7 @@ def save_results(results: List[PipelineOutput], save_path: str, output_type: str
 
         if result.latent is not None and output_type in ("latent", "both"):
             from safetensors.torch import save_file
+
             latent_path = os.path.join(save_path, f"{base_name}_latent.safetensors")
             save_file({"latent": result.latent.contiguous()}, latent_path, metadata={"seed": str(result.seed)})
             logger.info(f"Saved latent: {latent_path}")
@@ -313,22 +321,24 @@ def main():
         image, control_images, control_masks = load_images_if_paths(
             args.image_path, args.control_image_path, args.control_image_mask_path
         )
-        inputs = [ImageInput(
-            prompt=args.prompt,
-            negative_prompt=args.negative_prompt,
-            image=image,
-            control_images=control_images,
-            control_masks=control_masks,
-            image_size=tuple(args.image_size),
-            seed=args.seed,
-            infer_steps=args.infer_steps,
-            guidance_scale=args.guidance_scale,
-            embedded_cfg_scale=args.embedded_cfg_scale,
-            guidance_rescale=args.guidance_rescale,
-            flow_shift=args.flow_shift,
-            one_frame_settings=parse_one_frame_string(args.one_frame_inference),
-            custom_system_prompt=args.custom_system_prompt,
-        )]
+        inputs = [
+            ImageInput(
+                prompt=args.prompt,
+                negative_prompt=args.negative_prompt,
+                image=image,
+                control_images=control_images,
+                control_masks=control_masks,
+                image_size=tuple(args.image_size),
+                seed=args.seed,
+                infer_steps=args.infer_steps,
+                guidance_scale=args.guidance_scale,
+                embedded_cfg_scale=args.embedded_cfg_scale,
+                guidance_rescale=args.guidance_rescale,
+                flow_shift=args.flow_shift,
+                one_frame_settings=parse_one_frame_string(args.one_frame_inference),
+                custom_system_prompt=args.custom_system_prompt,
+            )
+        ]
     else:
         raise ValueError("Either --prompt or --from_file must be specified")
 
