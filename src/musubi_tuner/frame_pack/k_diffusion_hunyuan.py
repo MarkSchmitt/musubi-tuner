@@ -57,6 +57,7 @@ def sample_hunyuan(
     device=None,
     negative_kwargs=None,
     callback=None,
+    noise=None,
     **kwargs,
 ):
     device = device or transformer.device
@@ -64,9 +65,12 @@ def sample_hunyuan(
     if batch_size is None:
         batch_size = int(prompt_embeds.shape[0])
 
-    latents = torch.randn(
-        (batch_size, 16, (frames + 3) // 4, height // 8, width // 8), generator=generator, device=generator.device
-    ).to(device=device, dtype=torch.float32)
+    if noise is not None:
+        latents = noise.to(device=device, dtype=torch.float32)
+    else:
+        latents = torch.randn(
+            (batch_size, 16, (frames + 3) // 4, height // 8, width // 8), generator=generator, device=generator.device
+        ).to(device=device, dtype=torch.float32)
 
     B, C, T, H, W = latents.shape
     seq_length = T * H * W // 4  # 9*80*80//4 = 14400

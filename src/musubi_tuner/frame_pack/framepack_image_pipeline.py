@@ -89,6 +89,7 @@ class ImageInput:
 
     prompt: str = ""
     negative_prompt: str = ""
+    image_path: Optional[str] = None
     image: Optional[Image.Image] = None
     control_images: Optional[List[Image.Image]] = None
     control_masks: Optional[List[Image.Image]] = None
@@ -351,6 +352,7 @@ class FramePackImagePipeline:
         inputs: Union[ImageInput, List[ImageInput]],
         batch_size: int = 1,
         output_type: str = "pil",
+        generation_callback: Optional[callable] = None,
     ) -> List[PipelineOutput]:
         """Generate images from the given inputs.
 
@@ -360,6 +362,8 @@ class FramePackImagePipeline:
                 All text/image encoding and VAE decoding are done for all inputs at once,
                 while DiT generation is batched by this size.
             output_type: "pil" for PIL Images, "latent" for raw latents, "both" for both.
+            generation_callback: Optional callback function called after each batch of generation with signature
+                (batch_index: int, latents: List[torch.Tensor], seeds: List[int]) -> None
 
         Returns:
             List of PipelineOutput, one per input.
@@ -397,6 +401,9 @@ class FramePackImagePipeline:
             latents, seeds = self._generate_batch(batch_inputs, batch_text, batch_image)
             all_latents.extend(latents)
             all_seeds.extend(seeds)
+
+            if generation_callback is not None:
+                generation_callback(batch_start // batch_size, latents, seeds)
 
         # --- Phase 4: VAE decode (VAE on GPU, DiT off) ---
         results = []
@@ -576,121 +583,187 @@ class FramePackImagePipeline:
         text_data: List[Dict[str, Any]],
         image_data: List[Dict[str, Any]],
     ) -> tuple:
-        """Generate latents for a batch of inputs. Returns (latents_list, seeds_list)."""
-        device = self.device
-        latents = []
-        seeds = []
+        """Generate latents for a batch of inputs using true batched inference.
 
-        for inp, td, imd in zip(inputs, text_data, image_data):
+        All inputs in a batch must share the same height, width, infer_steps,
+        guidance_scale, embedded_cfg_scale, guidance_rescale, flow_shift,
+        and one_frame_settings. If they differ, a ValueError is raised.
+
+        Returns (latents_list, seeds_list) where each latent has batch_size=1.
+        """
+        device = self.device
+        batch_size = len(inputs)
+
+        if batch_size == 0:
+            return [], []
+
+        # --- Validate batch uniformity ---
+        ref = inputs[0]
+        ref_imd = image_data[0]
+        ref_one_frame = ref.one_frame_settings or OneFrameSettings()
+        ref_height, ref_width = ref_imd["height"], ref_imd["width"]
+
+        for i, (inp, imd) in enumerate(zip(inputs[1:], image_data[1:]), start=1):
+            h, w = imd["height"], imd["width"]
+            if (h, w) != (ref_height, ref_width):
+                raise ValueError(
+                    f"Batch item {i} has image_size ({h}, {w}) but item 0 has ({ref_height}, {ref_width}). "
+                    "All items in a batch must share the same image_size."
+                )
+            if inp.infer_steps != ref.infer_steps:
+                raise ValueError(f"Batch item {i} has infer_steps={inp.infer_steps} but item 0 has {ref.infer_steps}.")
+            if inp.guidance_scale != ref.guidance_scale:
+                raise ValueError(f"Batch item {i} has guidance_scale={inp.guidance_scale} but item 0 has {ref.guidance_scale}.")
+            if inp.embedded_cfg_scale != ref.embedded_cfg_scale:
+                raise ValueError(f"Batch item {i} has embedded_cfg_scale={inp.embedded_cfg_scale} but item 0 has {ref.embedded_cfg_scale}.")
+            if inp.guidance_rescale != ref.guidance_rescale:
+                raise ValueError(f"Batch item {i} has guidance_rescale={inp.guidance_rescale} but item 0 has {ref.guidance_rescale}.")
+            if inp.flow_shift != ref.flow_shift:
+                raise ValueError(f"Batch item {i} has flow_shift={inp.flow_shift} but item 0 has {ref.flow_shift}.")
+            item_one_frame = inp.one_frame_settings or OneFrameSettings()
+            if item_one_frame != ref_one_frame:
+                raise ValueError(f"Batch item {i} has different one_frame_settings than item 0.")
+
+        height, width = ref_height, ref_width
+        latent_window_size = self.latent_window_size
+        one_frame = ref_one_frame
+
+        # --- Pre-generate noise per item for seed reproducibility ---
+        seeds = []
+        noise_list = []
+        latent_h, latent_w = height // 8, width // 8
+        frames = 1
+        latent_t = (frames + 3) // 4
+
+        for inp in inputs:
             seed = inp.seed if inp.seed is not None else random.randint(0, 2**32 - 1)
             seeds.append(seed)
+            g = torch.Generator(device="cpu")
+            g.manual_seed(seed)
+            noise = torch.randn((1, 16, latent_t, latent_h, latent_w), generator=g, device="cpu")
+            noise_list.append(noise)
 
-            seed_g = torch.Generator(device="cpu")
-            seed_g.manual_seed(seed)
+        batched_noise = torch.cat(noise_list, dim=0)  # (B, 16, T, H, W)
 
-            height = imd["height"]
-            width = imd["width"]
-            latent_window_size = self.latent_window_size
-            one_frame = inp.one_frame_settings or OneFrameSettings()
-
-            # Build one-frame latent structure (copy list to avoid mutating cached data)
+        # --- Build one-frame latent structure (shared across batch) ---
+        per_item_clean_latents = []
+        for i, (inp, imd) in enumerate(zip(inputs, image_data)):
             control_lats = list(imd["control_latents"]) if imd["control_latents"] else []
             control_masks = imd["control_mask_images"]
 
             if len(control_lats) == 0:
-                control_lats = [torch.zeros(1, 16, 1, height // 8, width // 8, dtype=torch.float32)]
+                control_lats = [torch.zeros(1, 16, 1, latent_h, latent_w, dtype=torch.float32)]
 
             if not one_frame.no_post:
-                control_lats.append(torch.zeros(1, 16, 1, height // 8, width // 8, dtype=torch.float32))
+                control_lats.append(torch.zeros(1, 16, 1, latent_h, latent_w, dtype=torch.float32))
 
-            clean_latents = torch.cat(control_lats, dim=2)
-            clean_latent_indices = torch.zeros((1, len(control_lats)), dtype=torch.int64)
-
-            if not one_frame.no_post:
-                clean_latent_indices[:, -1] = 1 + latent_window_size
+            item_clean = torch.cat(control_lats, dim=2)  # (1, 16, num_ctrl, H, W)
 
             # Apply control masks
             if inp.control_masks:
-                for i, mask_img in enumerate(inp.control_masks):
-                    if mask_img is not None and i < clean_latents.shape[2]:
+                for j, mask_img in enumerate(inp.control_masks):
+                    if mask_img is not None and j < item_clean.shape[2]:
                         mask_tensor = self._get_latent_mask(mask_img, height, width)
-                        clean_latents[:, :, i:i+1, :, :] = clean_latents[:, :, i:i+1, :, :] * mask_tensor
+                        item_clean[:, :, j:j+1, :, :] = item_clean[:, :, j:j+1, :, :] * mask_tensor
             elif control_masks:
-                for i, alpha in enumerate(control_masks):
-                    if alpha is not None and i < clean_latents.shape[2]:
+                for j, alpha in enumerate(control_masks):
+                    if alpha is not None and j < item_clean.shape[2]:
                         mask_tensor = self._get_latent_mask(alpha, height, width)
-                        clean_latents[:, :, i:i+1, :, :] = clean_latents[:, :, i:i+1, :, :] * mask_tensor
+                        item_clean[:, :, j:j+1, :, :] = item_clean[:, :, j:j+1, :, :] * mask_tensor
 
-            # Target index
-            latent_indices = torch.zeros((1, 1), dtype=torch.int64)
-            latent_indices[:, 0] = one_frame.target_index if one_frame.target_index is not None else latent_window_size
+            per_item_clean_latents.append(item_clean)
 
-            # Control indices override
-            if one_frame.control_indices is not None:
-                for i, idx in enumerate(one_frame.control_indices):
-                    if i < clean_latent_indices.shape[1]:
-                        clean_latent_indices[:, i] = idx
+        # Verify all items have the same number of control frames
+        num_ctrl_frames = per_item_clean_latents[0].shape[2]
+        for i, cl in enumerate(per_item_clean_latents[1:], start=1):
+            if cl.shape[2] != num_ctrl_frames:
+                raise ValueError(
+                    f"Batch item {i} has {cl.shape[2]} control frames but item 0 has {num_ctrl_frames}. "
+                    "All items in a batch must have the same number of control images."
+                )
 
-            # 2x / 4x clean latents
-            if one_frame.no_2x:
-                clean_latents_2x = None
-                clean_latent_2x_indices = None
-            else:
-                clean_latents_2x = torch.zeros((1, 16, 2, height // 8, width // 8), dtype=torch.float32)
-                index = 1 + latent_window_size + 1
-                clean_latent_2x_indices = torch.arange(index, index + 2).unsqueeze(0)
+        clean_latents = torch.cat(per_item_clean_latents, dim=0)  # (B, 16, num_ctrl, H, W)
 
-            if one_frame.no_4x:
-                clean_latents_4x = None
-                clean_latent_4x_indices = None
-            else:
-                clean_latents_4x = torch.zeros((1, 16, 16, height // 8, width // 8), dtype=torch.float32)
-                index = 1 + latent_window_size + 1 + 2
-                clean_latent_4x_indices = torch.arange(index, index + 16).unsqueeze(0)
+        # Clean latent indices (same for all items in batch)
+        num_control_lats = num_ctrl_frames
+        clean_latent_indices = torch.zeros((1, num_control_lats), dtype=torch.int64)
+        if not one_frame.no_post:
+            clean_latent_indices[:, -1] = 1 + latent_window_size
 
-            # Prepare conditioning tensors
-            llama_vec = td["context"]["llama_vec"].to(device, dtype=torch.bfloat16)
-            llama_attention_mask = td["context"]["llama_attention_mask"].to(device)
-            clip_l_pooler = td["context"]["clip_l_pooler"].to(device, dtype=torch.bfloat16)
-            image_encoder_last_hidden_state = imd["image_encoder_last_hidden_state"].to(device, dtype=torch.bfloat16)
+        if one_frame.control_indices is not None:
+            for i, idx in enumerate(one_frame.control_indices):
+                if i < clean_latent_indices.shape[1]:
+                    clean_latent_indices[:, i] = idx
 
-            llama_vec_n = td["context_null"]["llama_vec"].to(device, dtype=torch.bfloat16)
-            llama_attention_mask_n = td["context_null"]["llama_attention_mask"].to(device)
-            clip_l_pooler_n = td["context_null"]["clip_l_pooler"].to(device, dtype=torch.bfloat16)
+        clean_latent_indices = clean_latent_indices.expand(batch_size, -1)  # (B, num_ctrl)
 
-            generated = sample_hunyuan(
-                transformer=self.dit_model,
-                sampler=self.sample_solver,
-                width=width,
-                height=height,
-                frames=1,
-                real_guidance_scale=inp.guidance_scale,
-                distilled_guidance_scale=inp.embedded_cfg_scale,
-                guidance_rescale=inp.guidance_rescale,
-                shift=inp.flow_shift,
-                num_inference_steps=inp.infer_steps,
-                generator=seed_g,
-                prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
-                prompt_poolers=clip_l_pooler,
-                negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
-                negative_prompt_poolers=clip_l_pooler_n,
-                device=device,
-                dtype=torch.bfloat16,
-                image_embeddings=image_encoder_last_hidden_state,
-                latent_indices=latent_indices,
-                clean_latents=clean_latents,
-                clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=clean_latents_2x,
-                clean_latent_2x_indices=clean_latent_2x_indices,
-                clean_latents_4x=clean_latents_4x,
-                clean_latent_4x_indices=clean_latent_4x_indices,
-            )
+        # Target latent indices
+        target_idx = one_frame.target_index if one_frame.target_index is not None else latent_window_size
+        latent_indices = torch.full((batch_size, 1), target_idx, dtype=torch.int64)
 
-            latents.append(generated.to(clean_latents).cpu())
+        # 2x / 4x clean latents
+        if one_frame.no_2x:
+            clean_latents_2x = None
+            clean_latent_2x_indices = None
+        else:
+            clean_latents_2x = torch.zeros((batch_size, 16, 2, latent_h, latent_w), dtype=torch.float32)
+            index = 1 + latent_window_size + 1
+            clean_latent_2x_indices = torch.arange(index, index + 2).unsqueeze(0).expand(batch_size, -1)
 
-        return latents, seeds
+        if one_frame.no_4x:
+            clean_latents_4x = None
+            clean_latent_4x_indices = None
+        else:
+            clean_latents_4x = torch.zeros((batch_size, 16, 16, latent_h, latent_w), dtype=torch.float32)
+            index = 1 + latent_window_size + 1 + 2
+            clean_latent_4x_indices = torch.arange(index, index + 16).unsqueeze(0).expand(batch_size, -1)
+
+        # --- Batch conditioning tensors ---
+        llama_vecs = torch.cat([td["context"]["llama_vec"] for td in text_data], dim=0).to(device, dtype=torch.bfloat16)
+        llama_masks = torch.cat([td["context"]["llama_attention_mask"] for td in text_data], dim=0).to(device)
+        clip_poolers = torch.cat([td["context"]["clip_l_pooler"] for td in text_data], dim=0).to(device, dtype=torch.bfloat16)
+        img_embeds = torch.cat([imd["image_encoder_last_hidden_state"] for imd in image_data], dim=0).to(device, dtype=torch.bfloat16)
+
+        llama_vecs_n = torch.cat([td["context_null"]["llama_vec"] for td in text_data], dim=0).to(device, dtype=torch.bfloat16)
+        llama_masks_n = torch.cat([td["context_null"]["llama_attention_mask"] for td in text_data], dim=0).to(device)
+        clip_poolers_n = torch.cat([td["context_null"]["clip_l_pooler"] for td in text_data], dim=0).to(device, dtype=torch.bfloat16)
+
+        # --- Single batched call to sample_hunyuan ---
+        generated = sample_hunyuan(
+            transformer=self.dit_model,
+            sampler=self.sample_solver,
+            width=width,
+            height=height,
+            frames=frames,
+            real_guidance_scale=ref.guidance_scale,
+            distilled_guidance_scale=ref.embedded_cfg_scale,
+            guidance_rescale=ref.guidance_rescale,
+            shift=ref.flow_shift,
+            num_inference_steps=ref.infer_steps,
+            batch_size=batch_size,
+            noise=batched_noise,
+            prompt_embeds=llama_vecs,
+            prompt_embeds_mask=llama_masks,
+            prompt_poolers=clip_poolers,
+            negative_prompt_embeds=llama_vecs_n,
+            negative_prompt_embeds_mask=llama_masks_n,
+            negative_prompt_poolers=clip_poolers_n,
+            device=device,
+            dtype=torch.bfloat16,
+            image_embeddings=img_embeds,
+            latent_indices=latent_indices,
+            clean_latents=clean_latents,
+            clean_latent_indices=clean_latent_indices,
+            clean_latents_2x=clean_latents_2x,
+            clean_latent_2x_indices=clean_latent_2x_indices,
+            clean_latents_4x=clean_latents_4x,
+            clean_latent_4x_indices=clean_latent_4x_indices,
+        )
+
+        # Split batch results into per-item latents
+        result_latents = [generated[i:i+1].to(torch.float32).cpu() for i in range(batch_size)]
+
+        return result_latents, seeds
 
     @staticmethod
     def _get_latent_mask(mask_image: Image.Image, height: int, width: int) -> torch.Tensor:
