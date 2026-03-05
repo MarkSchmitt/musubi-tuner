@@ -518,8 +518,8 @@ def fp8_linear_forward_scaled_mm(
         else:
             scale_a_dtype = torch.float32
             scale_b_dtype = torch.float32
-        scale_a_matrix = scale_a_matrix.to(dtype=scale_a_dtype, device=input_qdata.device).contiguous()
-        scale_b_matrix = scale_b_matrix.to(dtype=scale_b_dtype, device=weight_qdata.device).squeeze(2).contiguous()
+        scale_a_matrix = scale_a_matrix.to(dtype=scale_a_dtype, device=input_qdata.device)
+        scale_b_matrix = scale_b_matrix.to(dtype=scale_b_dtype, device=weight_qdata.device).squeeze(2)
         mat_b = weight_qdata.contiguous().t()
 
         use_two_level_scaling = input_tensor_scale is not None and weight_tensor_scale is not None
@@ -528,8 +528,8 @@ def fp8_linear_forward_scaled_mm(
             scale_a_block = to_blocked(scale_a_matrix, flatten=True).contiguous()
             scale_b_block = to_blocked(scale_b_matrix, flatten=True).contiguous()
         else:
-            scale_a_block = scale_a_matrix
-            scale_b_block = scale_b_matrix
+            scale_a_block = scale_a_matrix.contiguous()
+            scale_b_block = scale_b_matrix.contiguous()
 
         if use_two_level_scaling:
             scale_a_tensor = input_tensor_scale.to(dtype=torch.float32, device=input_qdata.device).reshape(1).contiguous()
@@ -548,11 +548,6 @@ def fp8_linear_forward_scaled_mm(
             swizzle_a = swizzle_type
             swizzle_b = swizzle_type
 
-        # print(f"input_qdata shape: {input_qdata.shape}, weight_qdata shape: {weight_qdata.shape}")
-        # print(
-        #     f"scale_a shape: {scale_a.shape}, scale_b shape: {scale_b.shape}, scale_recipe_a: {scale_recipe_a}, scale_recipe_b: {scale_recipe_b}, swizzle_a: {swizzle_a}, swizzle_b: {swizzle_b}"
-        # )
-        # print(f"scale_a dtype: {scale_a.dtype}, scale_b dtype: {scale_b.dtype}")
         result = torch.nn.functional.scaled_mm(
             input_qdata,
             mat_b,
@@ -670,14 +665,14 @@ def quantize_fp8_for_scaled_mm(
         block_absmax = torch.max(torch.abs(x_blocks), dim=2, keepdim=True).values
         block_scale = torch.clamp(block_absmax / fp8_max, min=1e-8).to(dtype=torch.float32)
 
-        if block_size != 32:
+        if block_size == 32:
+            block_scale = block_scale.to(torch.float8_e8m0fnu).to(torch.float32)
+            tensor_scale = torch.tensor(1.0, dtype=torch.float32, device=block_scale.device)
+        else:
             tensor_scale = torch.max(block_scale)
             tensor_scale = torch.clamp(tensor_scale, min=1e-8).to(dtype=torch.float32)
             block_scale = block_scale / tensor_scale
             block_scale = torch.clamp(block_scale, min=1e-8)
-        else:
-            block_scale = block_scale.to(torch.float8_e8m0fnu).to(torch.float32)
-            tensor_scale = torch.tensor(1.0, dtype=torch.float32, device=block_scale.device)
 
         total_scale = block_scale * tensor_scale
         qdata = quantize_fp8(x_blocks, total_scale, fp8_dtype, fp8_max, fp8_min).contiguous().view_as(x_2d)
@@ -807,16 +802,18 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
 
     else:
         # Dequantize the weight
-        original_dtype = self.scale_weight.dtype
+        # Use input dtype as original dtype for calculation (e.g., if input is float16, keep calculation in float16 for better performance)
+        original_dtype = x.dtype
+
         weight_tensor_scale = getattr(self, "scale_weight_tensor", None)
         if self.scale_weight.ndim < 3:
             # per-tensor or per-channel quantization, we can broadcast
-            dequantized_weight = self.weight.to(original_dtype) * self.scale_weight
+            dequantized_weight = self.weight.to(original_dtype) * self.scale_weight.to(original_dtype)
         else:
             # block-wise quantization, need to reshape weight to match scale shape for broadcasting
             out_features, num_blocks, _ = self.scale_weight.shape
             dequantized_weight = self.weight.to(original_dtype).contiguous().view(out_features, num_blocks, -1)
-            dequantized_weight = dequantized_weight * self.scale_weight
+            dequantized_weight = dequantized_weight * self.scale_weight.to(original_dtype)
             if weight_tensor_scale is not None:
                 dequantized_weight = dequantized_weight * weight_tensor_scale.to(dtype=dequantized_weight.dtype)
             dequantized_weight = dequantized_weight.view(self.weight.shape)
