@@ -30,6 +30,7 @@ import torch
 import numpy as np
 from PIL import Image
 from safetensors.torch import load_file
+import tqdm
 
 from musubi_tuner.frame_pack.utils import crop_or_pad_yield_mask
 from musubi_tuner.frame_pack import hunyuan
@@ -548,7 +549,7 @@ class FramePackImagePipeline:
 
         results = []
         try:
-            for inp in inputs:
+            for inp in tqdm.tqdm(inputs, desc="Preprocessing images", unit="image"):
                 height, width = inp.image_size
 
                 if inp.image is not None:
@@ -562,19 +563,21 @@ class FramePackImagePipeline:
                     image_encoder_output = hf_clip_vision_encode(img_np, self.feature_extractor, self.image_encoder)
                 image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.cpu()
 
-                # VAE encode
-                start_latent = hunyuan.vae_encode(img_tensor.to(device), self.vae).cpu()
+                # # VAE encode
+                # start_latent = hunyuan.vae_encode(img_tensor.to(device), self.vae).cpu()
 
                 # Control images
-                control_latents = None
+                control_tensors = None
                 control_mask_images = None
                 if inp.control_images:
-                    control_latents = []
+                    # control_latents = []
+                    control_tensors = []
                     control_mask_images = []
                     for ctrl_img in inp.control_images:
                         ctrl_tensor, _, ctrl_alpha = self._preprocess_pil_image(ctrl_img, height, width)
-                        ctrl_latent = hunyuan.vae_encode(ctrl_tensor.to(device), self.vae).cpu()
-                        control_latents.append(ctrl_latent)
+                        # ctrl_latent = hunyuan.vae_encode(ctrl_tensor.to(device), self.vae).cpu()
+                        # control_latents.append(ctrl_latent)
+                        control_tensors.append(ctrl_tensor)
                         control_mask_images.append(ctrl_alpha)
 
                 results.append(
@@ -582,11 +585,35 @@ class FramePackImagePipeline:
                         "height": height,
                         "width": width,
                         "image_encoder_last_hidden_state": image_encoder_last_hidden_state,
-                        "start_latent": start_latent,
-                        "control_latents": control_latents,
+                        "img_tensor": img_tensor,
+                        "control_tensors": control_tensors,
                         "control_mask_images": control_mask_images,
                     }
                 )
+
+            # Encode with VAE
+            for res in tqdm.tqdm(results, desc="Encoding with VAE", unit="image"):
+                img_tensor = res["img_tensor"]
+                with torch.no_grad():
+                    start_latent = hunyuan.vae_encode(img_tensor.to(device), self.vae).cpu()
+                res["start_latent"] = start_latent
+                res.pop("img_tensor")  # free memory
+
+                control_tensors = res["control_tensors"]
+                if control_tensors is not None:
+                    control_latents = []
+                    for ctrl_tensor in control_tensors:
+                        # If ctrl_tensor is same as img_tensor, reuse start_latent to save memory and computation
+                        if torch.equal(ctrl_tensor, img_tensor):
+                            ctrl_latent = start_latent
+                        else:
+                            ctrl_tensor = ctrl_tensor.to(device)
+                            with torch.no_grad():
+                                ctrl_latent = hunyuan.vae_encode(ctrl_tensor, self.vae).cpu()
+                        control_latents.append(ctrl_latent)
+                    res["control_latents"] = control_latents
+                res.pop("control_tensors")  # free memory
+
         finally:
             self.vae.to("cpu")
             self.image_encoder.to("cpu")
@@ -816,7 +843,7 @@ class FramePackImagePipeline:
 
         images = []
         try:
-            for latent in latents:
+            for latent in tqdm.tqdm(latents, desc="Decoding latents", unit="latent"):
                 if latent.ndim == 4:
                     latent = latent.unsqueeze(0)
 
