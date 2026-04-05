@@ -40,9 +40,13 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs = []
+    scale_swap_jobs = []
     for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
         if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
             weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+        # Track fp8 scale_weight buffers for swapping
+        if hasattr(module_to_cpu, "scale_weight") and module_to_cpu.scale_weight is not None:
+            scale_swap_jobs.append((module_to_cpu, module_to_cuda))
 
     # device to cpu
     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
@@ -55,6 +59,13 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
         cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
         module_to_cuda.weight.data = cuda_data_view
 
+    # swap scale_weight buffers (fp8_scaled support)
+    for module_to_cpu, module_to_cuda in scale_swap_jobs:
+        cpu_scale = module_to_cpu.scale_weight.data.to("cpu", non_blocking=True)
+        cuda_scale = module_to_cuda.scale_weight.data.to(device, non_blocking=True)
+        module_to_cpu.scale_weight.data = cpu_scale
+        module_to_cuda.scale_weight.data = cuda_scale
+
     _synchronize_device(device)
 
 
@@ -62,6 +73,8 @@ def weighs_to_device(layer: nn.Module, device: torch.device):
     for module in layer.modules():
         if hasattr(module, "weight") and module.weight is not None and module.__class__.__name__.endswith("Linear"):
             module.weight.data = module.weight.data.to(device, non_blocking=device.type != "cpu")
+            # fp8 scale_weight is kept CUDA-resident permanently (swap_weight_devices_cuda only swaps .weight).
+            # Moving scale_weight to CPU here would leave it stranded after async weight swaps during forward.
 
 
 class Offloader:
