@@ -109,6 +109,7 @@ class Offloader:
         self.thread_pool = ThreadPoolExecutor(max_workers=1)
         self.futures = {}
         self.cuda_available = device.type == "cuda"
+        self.xpu_available = device.type == "xpu"
         self.stream = torch.cuda.Stream(device=device) if self.cuda_available else None
 
         # Staging buffers for cuda offloading without large pinned memory. These are pinned memory buffers to speed up the transfer between CPU and GPU
@@ -317,8 +318,9 @@ class Offloader:
                     f"[{self.block_type}] Move block {bidx_to_cpu} to CPU and block {bidx_to_cuda} to {'CUDA' if self.cuda_available else 'device'}"
                 )
 
-            dev = self.device.index if self.device.index is not None else torch.cuda.current_device()
-            torch.cuda.set_device(dev)
+            dev = self.device.index if self.device.index is not None else (torch.cuda.current_device() if self.cuda_available else 0)
+            if self.cuda_available:
+                torch.cuda.set_device(dev)
 
             sync_event = self.swap_weight_devices(block_to_cpu, block_to_cuda)
 
