@@ -2297,6 +2297,10 @@ class NetworkTrainer:
                     )
                     accelerator.log(logs, step=global_step)
 
+                # Periodic XPU synchronization to prevent driver queue buildup / deadlocks
+                if accelerator.device.type == "xpu" and global_step > 0 and global_step % 50 == 0:
+                    torch.xpu.synchronize()
+
                 if global_step >= args.max_train_steps:
                     break
 

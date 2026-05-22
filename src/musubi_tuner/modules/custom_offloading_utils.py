@@ -24,6 +24,21 @@ def _clean_memory_on_device(device: torch.device):
         torch.mps.empty_cache()
 
 
+class _SyncFuture:
+    """A Future-like object that wraps an already-completed result.
+
+    Used on XPU/non-CUDA devices where block swaps are performed synchronously
+    on the calling thread. This avoids the ThreadPoolExecutor deadlock that
+    occurs when torch.xpu.synchronize() is called from a worker thread.
+    """
+
+    def __init__(self, result):
+        self._result = result
+
+    def result(self, timeout=None):
+        return self._result
+
+
 def _synchronize_device(device: torch.device):
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -34,39 +49,31 @@ def _synchronize_device(device: torch.device):
 
 
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
-    """
-    not tested
+    """Swap weights between two layers without CUDA streams.
+
+    On XPU/non-CUDA devices, transfers are inherently synchronous so we avoid
+    the redundant torch.xpu.synchronize() calls that the original code made
+    between the two halves of the swap.  Those per-swap synchronize calls can
+    trigger UR_RESULT_ERROR_DEVICE_LOST on Intel Arc GPUs when invoked during
+    an active autograd pass.
     """
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs = []
-    scale_swap_jobs = []
     for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
         if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
             weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
-        # Track fp8 scale_weight buffers for swapping
-        if hasattr(module_to_cpu, "scale_weight") and module_to_cpu.scale_weight is not None:
-            scale_swap_jobs.append((module_to_cpu, module_to_cuda))
 
-    # device to cpu
-    for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-        module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
-
-    _synchronize_device(device)
-
-    # cpu to device
-    for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-        cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
-        module_to_cuda.weight.data = cuda_data_view
-
-    # swap scale_weight buffers (fp8_scaled support)
-    for module_to_cpu, module_to_cuda in scale_swap_jobs:
-        cpu_scale = module_to_cpu.scale_weight.data.to("cpu", non_blocking=True)
-        cuda_scale = module_to_cuda.scale_weight.data.to(device, non_blocking=True)
-        module_to_cpu.scale_weight.data = cpu_scale
-        module_to_cuda.scale_weight.data = cuda_scale
-
-    _synchronize_device(device)
+    # Cross-copy: swap data between CPU and device in one pass.
+    # On non-CUDA devices these operations are synchronous, so no
+    # inter-copy barrier is required.
+    for module_to_cpu, module_to_cuda, cpu_data, cuda_data in weight_swap_jobs:
+        # cpu_data is currently on GPU, cuda_data is currently on CPU
+        # Swap their contents by copying in opposite directions
+        cpu_data_new = cuda_data.to(device="cpu", non_blocking=False)
+        cuda_data_new = cpu_data.to(device=device, non_blocking=False)
+        module_to_cpu.weight.data = cpu_data_new
+        module_to_cuda.weight.data = cuda_data_new
 
 
 def weighs_to_device(layer: nn.Module, device: torch.device):
@@ -311,27 +318,46 @@ class Offloader:
         return sync_event
 
     def _submit_move_blocks(self, blocks, block_idx_to_cpu, block_idx_to_cuda):
+        block_to_cpu = blocks[block_idx_to_cpu]
+        block_to_cuda = blocks[block_idx_to_cuda]
+
+        # XPU/non-CUDA: perform synchronously on calling thread to avoid
+        # ThreadPoolExecutor deadlock (torch.xpu.synchronize is not
+        # thread-safe and the SYCL context is bound to the main thread).
+        if self.xpu_available or not self.cuda_available:
+            if self.debug:
+                start_time = time.perf_counter()
+                print(
+                    f"[{self.block_type}] Move block {block_idx_to_cpu} to CPU and block {block_idx_to_cuda} to device (synchronous)"
+                )
+
+            swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda)
+
+            if self.debug:
+                print(
+                    f"[{self.block_type}] Moved blocks {block_idx_to_cpu} to CPU and {block_idx_to_cuda} to device in {time.perf_counter() - start_time:.2f}s (synchronous)"
+                )
+
+            self.futures[block_idx_to_cuda] = _SyncFuture((block_idx_to_cpu, block_idx_to_cuda, None))
+            return
+
         def move_blocks(bidx_to_cpu, block_to_cpu, bidx_to_cuda, block_to_cuda):
             if self.debug:
                 start_time = time.perf_counter()
                 print(
-                    f"[{self.block_type}] Move block {bidx_to_cpu} to CPU and block {bidx_to_cuda} to {'CUDA' if self.cuda_available else 'device'}"
+                    f"[{self.block_type}] Move block {bidx_to_cpu} to CPU and block {bidx_to_cuda} to CUDA"
                 )
 
-            dev = self.device.index if self.device.index is not None else (torch.cuda.current_device() if self.cuda_available else 0)
-            if self.cuda_available:
-                torch.cuda.set_device(dev)
+            dev = self.device.index if self.device.index is not None else torch.cuda.current_device()
+            torch.cuda.set_device(dev)
 
             sync_event = self.swap_weight_devices(block_to_cpu, block_to_cuda)
 
             if self.debug:
                 print(
-                    f"[{self.block_type}] Moved blocks {bidx_to_cpu} to CPU and {bidx_to_cuda} to {'CUDA' if self.cuda_available else 'device'} in {time.perf_counter() - start_time:.2f}s"
+                    f"[{self.block_type}] Moved blocks {bidx_to_cpu} to CPU and {bidx_to_cuda} to CUDA in {time.perf_counter() - start_time:.2f}s"
                 )
             return bidx_to_cpu, bidx_to_cuda, sync_event
-
-        block_to_cpu = blocks[block_idx_to_cpu]
-        block_to_cuda = blocks[block_idx_to_cuda]
 
         self.futures[block_idx_to_cuda] = self.thread_pool.submit(
             move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
@@ -353,6 +379,11 @@ class Offloader:
         if self.cuda_available and sync_event is not None:
             # this does not wait CPU side, so the log below should be immediate when pinned memory is used
             torch.cuda.current_stream().wait_event(sync_event)
+
+        # On XPU, swaps are already synchronous (no thread pool), so no
+        # additional synchronisation is needed.  Calling torch.xpu.synchronize()
+        # here during an active autograd pass can trigger UR_RESULT_ERROR_DEVICE_LOST
+        # on Intel Arc GPUs.
 
         if self.debug:
             print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter() - start_time:.2f}s")
