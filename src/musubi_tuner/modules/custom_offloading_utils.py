@@ -64,16 +64,16 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
         if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
             weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
 
-    # Cross-copy: swap data between CPU and device in one pass.
-    # On non-CUDA devices these operations are synchronous, so no
-    # inter-copy barrier is required.
+    # Move each block to its target device. On non-CUDA devices these
+    # operations are synchronous, so no inter-copy barrier is required.
+    # IMPORTANT: each block keeps ITS OWN weights; only the device changes.
+    # Do NOT cross-assign the two blocks' weights (that scrambles parameters
+    # between blocks and silently corrupts training/inference).
     for module_to_cpu, module_to_cuda, cpu_data, cuda_data in weight_swap_jobs:
-        # cpu_data is currently on GPU, cuda_data is currently on CPU
-        # Swap their contents by copying in opposite directions
-        cpu_data_new = cuda_data.to(device="cpu", non_blocking=False)
-        cuda_data_new = cpu_data.to(device=device, non_blocking=False)
-        module_to_cpu.weight.data = cpu_data_new
-        module_to_cuda.weight.data = cuda_data_new
+        # cpu_data  = module_to_cpu's weights  (currently on device, going to CPU)
+        # cuda_data = module_to_cuda's weights (currently on CPU,   going to device)
+        module_to_cpu.weight.data = cpu_data.to(device="cpu", non_blocking=False)
+        module_to_cuda.weight.data = cuda_data.to(device=device, non_blocking=False)
 
 
 def weighs_to_device(layer: nn.Module, device: torch.device):
