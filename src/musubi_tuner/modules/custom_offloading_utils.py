@@ -72,8 +72,16 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
     for module_to_cpu, module_to_cuda, cpu_data, cuda_data in weight_swap_jobs:
         # cpu_data  = module_to_cpu's weights  (currently on device, going to CPU)
         # cuda_data = module_to_cuda's weights (currently on CPU,   going to device)
-        module_to_cpu.weight.data = cpu_data.to(device="cpu", non_blocking=False)
-        module_to_cuda.weight.data = cuda_data.to(device=device, non_blocking=False)
+        module_to_cpu.weight.data = cpu_data.to(device="cpu", non_blocking=True)
+        module_to_cuda.weight.data = cuda_data.to(device=device, non_blocking=True)
+    # One synchronize AFTER queuing all transfers. On XPU the non_blocking copies
+    # pipeline, so a single trailing sync drains them ~3x faster than blocking
+    # copies (which synchronize per tensor: ~3.3 -> ~10.6 GB/s on Arc B70).
+    # The sync is required: this synchronous path's contract is "all transfers
+    # complete before the function returns". A single synchronize on the calling
+    # (main) thread is safe -- this is NOT the per-swap mid-autograd synchronize
+    # from worker threads that triggered UR_RESULT_ERROR_DEVICE_LOST.
+    _synchronize_device(device)
 
 
 def weighs_to_device(layer: nn.Module, device: torch.device):
